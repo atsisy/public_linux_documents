@@ -1,0 +1,2 @@
+# public_linux_documents
+個人的に書き溜めているLinuxカーネルに関する日本語ドキュメント
