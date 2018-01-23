@@ -1,0 +1,445 @@
+#+TITLE: Linuxデバイスドライバプログラミング覚書
+
+* 自作デバイスドライバのデバイスファイル作成手順
+1. ロードしたいカーネルモジュール（.koファイル）があるディレクトリに移動
+2. `sudo insmod "インストールしたいカーネルオブジェクトファイル"`
+3. `sudo cat /proc/devices | grep "デバイスドライバ名"`を実行し、デバイスドライバのメジャー番号を確認
+4. `sudo mknod /dev/デバイスドライバ名 デバイスの種類 デバイスドライバのメジャー番号 マイナー番号のとり得る最大値`でデバイスファイルを作成
+5. ls等のコマンドで生成が成功しているか確認
+
+** 例
+#+BEGIN_SRC shell
+# ワーキングディレクトリに移動
+cd work_dir
+
+# sample.koをロード
+sudo insmod sample.ko
+
+# ロードされたsampleカーネルモジュールのメジャー番号を確認
+sudo cat /proc/devices | grep sample
+
+# メジャー番号が243だとする。またデバイスドライバの種類はキャラクタデバイスとする。
+sudo mknod /dev/sample c 243 2
+
+# デバイスファイルが作成されたか確認
+ls /dev | grep sample
+#+END_SRC
+
+*** デバイスドライバの種類におけるmknodコマンドのオペランドの対応表
+    | 文字   | 意味                                         |
+    | b      | ブロック型デバイス (block)                   |
+    | c or u | キャラクタ型デバイス (character, unbuffered) |
+    | p      | 名前付きパイプ。 FIFOとも呼ぶ (pipe)         |
+
+* 自作デバイスドライバのデバイスファイル削除手順
+1. sudo rm -f /dev/デバイスファイル名
+2. sudo rmmod カーネルモジュール名
+
+* file_operations構造体のメンバについて
+** ioctlフィールドについて
+***** ※Linux 4.13にて確認 (linux/fs.h)
+*** ioctlフィールドはunlocked_ioctlフィールドとcompat_ioctlフィールドに分けられて定義されている。
+    
+** unlocked_ioctlフィールドとcompat_ioctlフィールドの違い
+*** Linuxに含まれる公式ドキュメント
+    --
+     unlocked_ioctl: called by the ioctl(2) system call.
+     compat_ioctl: called by the ioctl(2) system call when 32 bit system calls                               
+     are used on 64 bit kernels.
+    -- 
+    unlocked_ioctlは、通常のioctl実装で、
+     compat_ioctlはCONFIG_X86_X32_ABIを有効にしてビルドした64bitカーネルに対して32bit版のioctlを呼び出したとき
+     (例えば32bit版のアプリからioctlを叩いたとき)に呼ばれるioctlということになります。
+    --
+**** それぞれのソースコードを見る
+
+#+BEGIN_SRC c
+
+/*
+ Linux4.14.3のソースコード
+ include/linux/file.h fd構造体
+*/
+struct fd {
+	struct file *file;
+	unsigned int flags;
+};
+
+/*
+  Linux4.14.3のソースコード
+  include/linux/file.h fdput関数
+*/
+static inline void fdput(struct fd fd)
+{
+	if (fd.flags & FDPUT_FPUT)
+		fput(fd.file);
+}
+
+/*
+ Linu4.14.3のソースコード
+ fs/compat_ioctl.h compat_ioctl_check_table関数
+*/
+static int compat_ioctl_check_table(unsigned int xcmd)
+{
+	int i;
+	const int max = ARRAY_SIZE(ioctl_pointer) - 1;
+
+	BUILD_BUG_ON(max >= (1 << 16));
+
+	/* guess initial offset into table, assuming a
+	   normalized distribution */
+	i = ((xcmd >> 16) * max) >> 16;
+
+	/* do linear search up first, until greater or equal */
+	while (ioctl_pointer[i] < xcmd && i < max)
+		i++;
+
+	/* then do linear search down */
+	while (ioctl_pointer[i] > xcmd && i > 0)
+		i--;
+
+	return ioctl_pointer[i] == xcmd;
+}
+
+
+/*
+ Linux 4.14.4
+ fs/ioctl.c do_vfs_ioctl関数
+*/
+/*
+  When you add any new common ioctls to the switches above and below
+  please update compat_sys_ioctl() too.
+ 
+  do_vfs_ioctl() is not for drivers and not intended to be EXPORT_SYMBOL()'d.
+  It's just a simple helper for sys_ioctl and compat_sys_ioctl.
+ */
+int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
+	     unsigned long arg)
+{
+	int error = 0;
+	int __user *argp = (int __user *)arg;
+	struct inode *inode = file_inode(filp);
+
+	switch (cmd) {
+	case FIOCLEX:
+		set_close_on_exec(fd, 1);
+		break;
+
+	case FIONCLEX:
+		set_close_on_exec(fd, 0);
+		break;
+
+	case FIONBIO:
+		error = ioctl_fionbio(filp, argp);
+		break;
+
+	case FIOASYNC:
+		error = ioctl_fioasync(fd, filp, argp);
+		break;
+
+	case FIOQSIZE:
+		if (S_ISDIR(inode->i_mode) || S_ISREG(inode->i_mode) ||
+		    S_ISLNK(inode->i_mode)) {
+			loff_t res = inode_get_bytes(inode);
+			error = copy_to_user(argp, &res, sizeof(res)) ?
+					-EFAULT : 0;
+		} else
+			error = -ENOTTY;
+		break;
+
+	case FIFREEZE:
+		error = ioctl_fsfreeze(filp);
+		break;
+
+	case FITHAW:
+		error = ioctl_fsthaw(filp);
+		break;
+
+	case FS_IOC_FIEMAP:
+		return ioctl_fiemap(filp, arg);
+
+	case FIGETBSZ:
+		return put_user(inode->i_sb->s_blocksize, argp);
+
+	case FICLONE:
+		return ioctl_file_clone(filp, arg, 0, 0, 0);
+
+	case FICLONERANGE:
+		return ioctl_file_clone_range(filp, argp);
+
+	case FIDEDUPERANGE:
+		return ioctl_file_dedupe_range(filp, argp);
+
+	default:
+		if (S_ISREG(inode->i_mode))
+			error = file_ioctl(filp, cmd, arg);
+		else
+			error = vfs_ioctl(filp, cmd, arg);
+		break;
+	}
+	return error;
+}
+
+/*
+ Linux 4.14.4のソースコード
+ fs/ioctl.c vfs_ioctl関数
+*/
+long vfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	int error = -ENOTTY;
+
+  // unlocked_ioctlは定義されているのか
+	if (!filp->f_op->unlocked_ioctl)
+		goto out;
+    
+  // 定義されたunlocked_ioctl関数を実行
+	error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
+  
+  // その結果が-ENOIOCTLCMDならば、error変数に-ENOTTYを代入
+	if (error == -ENOIOCTLCMD)
+		error = -ENOTTY;
+
+ out:
+  //最終的にはerror変数をリターン
+	return error;
+}
+
+
+/*
+  Linux 4.14.3のソースコード
+  fs/compat_ioctl.c COMPAT_SYSCALL_DEFINE3関数
+*/
+COMPAT_SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd,
+		       compat_ulong_t, arg32)
+{
+	unsigned long arg = arg32;
+	struct fd f = fdgetn(fd);
+	int error = -EBADF;
+	if (!f.file)
+		goto out;
+
+	/* RED-PEN how should LSM module know it's handling 32bit? */
+	error = security_file_ioctl(f.file, cmd, arg);
+	if (error)
+		goto out_fput;
+
+	/*
+	 * To allow the compat_ioctl handlers to be self contained
+	 * we need to check the common ioctls here first.
+	 * Just handle them with the standard handlers below.
+	 */
+	switch (cmd) {
+	case FIOCLEX:
+	case FIONCLEX:
+	case FIONBIO:
+	case FIOASYNC:
+	case FIOQSIZE:
+		break;
+
+#if defined(CONFIG_IA64) || defined(CONFIG_X86_64)
+	case FS_IOC_RESVSP_32:
+	case FS_IOC_RESVSP64_32:
+		error = compat_ioctl_preallocate(f.file, compat_ptr(arg));
+		goto out_fput;
+#else
+	case FS_IOC_RESVSP:
+	case FS_IOC_RESVSP64:
+		error = ioctl_preallocate(f.file, compat_ptr(arg));
+		goto out_fput;
+#endif
+
+	case FICLONE:
+	case FICLONERANGE:
+	case FIDEDUPERANGE:
+		goto do_ioctl;
+
+	case FIBMAP:
+	case FIGETBSZ:
+	case FIONREAD:
+		if (S_ISREG(file_inode(f.file)->i_mode))
+			break;
+		/*FALL THROUGH*/
+
+	default:
+
+  /*
+  * f.file->f_op->compat_ioctlはおそらくfile_operations構造体に代入された
+  * compat_ioctlが定義されている（デフォルトのNULLではなく、モジュールプログラマによって指定されている）場合、
+  * それを実行し、その結果をerror変数に代入する。
+  */
+		if (f.file->f_op->compat_ioctl) {
+      
+      // 実行。 errorに指定された関数の返り値を格納
+			error = f.file->f_op->compat_ioctl(f.file, cmd, arg);
+
+      /*
+      * 結果が-ENOIOCTLCMDの値以外だった場合（致命的なエラーではない）、out_fputラベルにジャンプ
+      */
+			if (error != -ENOIOCTLCMD)
+				goto out_fput;
+		}
+
+    /*
+    compat_ioctlが定義されていない場合、do_ioctlラベルにジャンプする。
+    */
+		if (!f.file->f_op->unlocked_ioctl)
+			goto do_ioctl;
+		break;
+	}
+
+  /*
+  compat_ioctl_check_table()を呼び、渡されたcmdが特殊な扱いをするものか調べる。
+  具体的には、fs/compat_ioctl.cに定義されているioctl_pointer[]内に該当cmdがあるか調べる。
+  特殊な扱いをするものであれば、do_vfs_ioctl関数が呼ばれる。
+  */
+	if (compat_ioctl_check_table(XFORM(cmd)))
+		goto found_handler;
+
+	error = do_ioctl_trans(cmd, arg, f.file);
+	if (error == -ENOIOCTLCMD)
+		error = -ENOTTY;
+
+	goto out_fput;
+
+ found_handler:
+	arg = (unsigned long)compat_ptr(arg);
+ do_ioctl:
+  /*
+  do_vfs_ioctlを呼び出して、定義されたunlocked_ioctl関数を呼び出す。
+  */
+	error = do_vfs_ioctl(f.file, fd, cmd, arg);
+ out_fput:
+  // fd構造体の情報を出力する関数を呼び出す。ソースは上部に記述
+	fdput(f);
+ out:
+	return error;
+}
+
+#+END_SRC
+
+** 実際にコードを書くときの注意点
+*** それぞれのioctlフィールドとの変更点を認識するために、Linux 4.14.4のfile_operations構造体のソースコードを見る
+#+BEGIN_SRC c
+struct file_operations {
+	struct module *owner;
+	loff_t (*llseek) (struct file *, loff_t, int);
+	ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
+	ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+	ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
+	ssize_t (*write_iter) (struct kiocb *, struct iov_iter *);
+	int (*iterate) (struct file *, struct dir_context *);
+	int (*iterate_shared) (struct file *, struct dir_context *);
+	unsigned int (*poll) (struct file *, struct poll_table_struct *);
+	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+	long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
+	int (*mmap) (struct file *, struct vm_area_struct *);
+	int (*open) (struct inode *, struct file *);
+	int (*flush) (struct file *, fl_owner_t id);
+	int (*release) (struct inode *, struct file *);
+	int (*fsync) (struct file *, loff_t, loff_t, int datasync);
+	int (*fasync) (int, struct file *, int);
+	int (*lock) (struct file *, int, struct file_lock *);
+	ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int);
+	unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
+	int (*check_flags)(int);
+	int (*flock) (struct file *, int, struct file_lock *);
+	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
+	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
+	int (*setlease)(struct file *, long, struct file_lock **, void **);
+	long (*fallocate)(struct file *file, int mode, loff_t offset,
+			  loff_t len);
+	void (*show_fdinfo)(struct seq_file *m, struct file *f);
+#ifndef CONFIG_MMU
+	unsigned (*mmap_capabilities)(struct file *);
+#endif
+	ssize_t (*copy_file_range)(struct file *, loff_t, struct file *,
+			loff_t, size_t, unsigned int);
+	int (*clone_file_range)(struct file *, loff_t, struct file *, loff_t,
+			u64);
+	ssize_t (*dedupe_file_range)(struct file *, u64, u64, struct file *,
+			u64);
+} __randomize_layout;
+#+END_SRC
+
+*** これによると、compatとunlockedの変更点は以下
+    |   | 変更点                                                        |
+    | 1 | 第一引数のstruct *inodeが削除されて、それぞれ一つづつ前に来た |
+    | 2 |                                                               |
+    
+* class_device_create/destoryからdevice_create/destroyに移行した話
+*** 2006年ごろにclass_device_create/destroyは廃止が決定し、Linux 2.6.26-rc2あたりで削除された。
+*** 移行先として、device_create/destoryが実装されているのでそれを使いましょう。
+** 基本的な使い方に関してはdestroyは変わらない。createは変わるので注意
+**** class_device_create関数とdevice_create関数の異なる点
+     |        | class_device_create関数 | device_create関数 |
+     | 返り値 | struct class_device *   | struct device *   |
+
+* カーネルモジュール開発における32/64bitの注意点
+** ポインタのサイズによって、構造体フィールドのオフセットが異なり、32/64bit間でメモリマップが異なってしまうことの対策
+#+BEGIN_SRC c
+
+/*
+ ダメな例
+*/
+struct ioctl_cmd {
+        int cmd;
+        unsigned int size;
+        unsigned char *buf;
+        int flag;
+};
+
+/*
+ 32/64bitの相違点をカバーする構造体
+ 追加されたフィールド
+ mbzフィールド
+ アプリケーションが32itの場合、ポインタは4バイトになってしまい、
+ 64bitのときのflagフィールドのオフセットが異なってしまう。
+ なので、32bit(4バイト)の変数mbzを追加して、flagフィールドの
+ オフセットを32/64bit間で、統一しようと言うやつ
+ dummy_padフィールド
+ このフィールドが存在していないと、構造体のサイズは20バイト。
+ 構造体のサイズを8バイト境界にすることで、32/64bitでの差を埋めたい。
+ そのため、dummy_padフィールドを追加する。
+*/
+struct ioctl_cmd {
+        int cmd;
+        unsigned int size;
+#ifdef __LP64__
+        unsigned char *buf;
+#else
+        unsigned char *buf;
+        unsigned int mbz;
+#endif
+        int flag;
+        int dummy_pad;
+}
+
+#+END_SRC
+
+*** ビックエディアンの対応
+#+BEGIN_SRC c
+
+#include <asm/byteorder.h>
+
+struct ioctl_cmd {
+        int cmd;
+        unsigned int size;
+#ifdef __LP64__
+        unsigned char *buf;
+#else
+
+#ifdef __LITTLE_ENDIAN_BITFIELD
+        unsigned char *buf;
+        unsigned int mbz;
+#elif __BIG_ENDIAN_BITFIELD
+        unsigned mbz;
+        unsigned char *buf;
+#else
+#error "Please fix <asm/byteorder.h>"
+#endif
+
+#endif
+        int flag;
+        int dummy_pad;
+};
+
+#+END_SRC
