@@ -1,0 +1,41 @@
+#+TITLE: 適当にソースを解説
+
+* その場のノリで書いているので、脈絡はありません
+
+
+** cdev_init関数
+*** 基本情報
+| Linux kernel | 4.14.14 |
+
+#+BEGIN_SRC c
+/**
+ * cdev_init() - initialize a cdev structure
+ * @cdev: the structure to initialize
+ * @fops: the file_operations for this device
+ *
+ * Initializes @cdev, remembering @fops, making it ready to add to the
+ * system with cdev_add().
+ */
+void cdev_init(struct cdev *cdev, const struct file_operations *fops)
+{
+	memset(cdev, 0, sizeof *cdev);
+	INIT_LIST_HEAD(&cdev->list);
+	kobject_init(&cdev->kobj, &ktype_cdev_default);
+	cdev->ops = fops;
+}
+#+END_SRC
+*** 上部コメント
+    cdev_init() - cdev構造体を初期化します。
+    @cdev: 初期化したいcdev構造体へのポインタ
+    @fops: cdevが指すデバイスに対するfile_operations構造体へのポインタ
+    @vdevを初期化、@fopsを記憶し、cdev_add()でシステムに追加する準備を行います。
+*** ソースを読む
+**** 1行目
+     cdev変数が指す構造体を0クリアする。
+**** 2行目
+     cdev構造体のlistを初期化
+**** 3行目
+     cdev構造体のkobjをデフォルトの状態に初期化
+**** 4行目
+     cdev構造体のopsに@fopsを代入
+
