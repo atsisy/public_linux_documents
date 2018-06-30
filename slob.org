@@ -1,0 +1,89 @@
+#+TITLE: メモリアロケータ slob
+
+* 関数の説明
+** kmem_cache_init,kmem_cache_init_late関数
+*** ソース
+    #+BEGIN_SRC c   
+void __init kmem_cache_init(void)
+{
+	kmem_cache = &kmem_cache_boot;
+	slab_state = UP;
+}
+
+void __init kmem_cache_init_late(void)
+{
+	slab_state = FULL;
+}
+
+    #+END_SRC
+*** 解説
+    この２つの関数はカーネルが起動した直後のstart_kernel関数内で呼び出されています。
+    やっていることは単純で、kmem_cache_initでは、以下のように定義したグローバル変数kmem_cache_bootをkmem_cacheに代入しています。
+    このkmem_cacheはmm/slab_commoで宣言されたkmem_cache構造体へのポインタ変数です。
+
+    次に、slab_stateですが、これはメモリアロケータの状態を指します。
+    状態については以下のように定義されています。
+
+#+BEGIN_SRC c
+struct kmem_cache kmem_cache_boot = {
+	.name = "kmem_cache",
+	.size = sizeof(struct kmem_cache),
+	.flags = SLAB_PANIC,
+	.align = ARCH_KMALLOC_MINALIGN,
+};
+#+END_SRC
+
+#+BEGIN_SRC c
+/*
+ * State of the slab allocator.
+ *
+ * This is used to describe the states of the allocator during bootup.
+ * Allocators use this to gradually bootstrap themselves. Most allocators
+ * have the problem that the structures used for managing slab caches are
+ * allocated from slab caches themselves.
+ */
+enum slab_state {
+	DOWN,			/* No slab functionality yet */
+	PARTIAL,		/* SLUB: kmem_cache_node available */
+	PARTIAL_NODE,		/* SLAB: kmalloc size for node struct available */
+	UP,			/* Slab caches usable but not all extras yet */
+	FULL			/* Everything is working */
+};
+#+END_SRC
+
+   つまり、kmem_cache_initの時点ではUPであり、lateが呼び出された後、FULLになるということです。
+** __kmem_cache_create関数
+*** ソース
+#+BEGIN_SRC c
+int __kmem_cache_create(struct kmem_cache *c, unsigned long flags)
+{
+	if (flags & SLAB_DESTROY_BY_RCU) {
+		/* leave room for rcu footer at the end of object */
+		c->size += sizeof(struct slob_rcu);
+	}
+	c->flags = flags;
+	return 0;
+}
+#+END_SRC
+*** 解説
+    __kmem_cache_create関数はスラブキャッシュを新しく作成する関数です。
+    フラグを確認し、SLAB_DESTROY_BY_RCUフラグが立っていた場合、このメモリの非同期処理はカーネルのrcuに任されることに
+    なります。その場合、スラブキャッシュへのディスクリプタであるcのsizeメンバにslob_rcu構造体分のサイズを追加しています。
+    ちなみに、slob_rcuは次のように定義されます。
+    #+BEGIN_SRC c
+    
+    /*
+    * struct slob_rcu is inserted at the tail of allocated slob blocks, which
+    * were created with a SLAB_DESTROY_BY_RCU slab. slob_rcu is used to free
+    * the block using call_rcu.
+    */
+    struct slob_rcu {
+	      struct rcu_head head;
+	      int size;
+    };
+
+    #+END_SRC
+
+    cのフラグには、この関数に渡されたflagをそのまま代入しています。
+    
+   
