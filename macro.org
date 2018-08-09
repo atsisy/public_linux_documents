@@ -1,0 +1,41 @@
+#+TITLE: マクロ
+
+* ALIGNマクロ
+#+BEGIN_SRC c
+ALIGN(size, BYTES_PER_WORD)
+#define	BYTES_PER_WORD		sizeof(void *)
+#define ALIGN(x,a)		__ALIGN_MASK(x,(typeof(x))(a)-1)
+#define __ALIGN_MASK(x,mask)	(((x)+(mask))&~(mask))
+#+END_SRC
+
+size = 200, BYTES_PER_WORD = 8
+
+ALIGN(size, BYTES_PER_WORD)
+=>
+ALIGN(200, (size_t)8 - 1)
+=>
+__ALIGN_MASK(200, 7)
+(0xc8 + 0x07) & ~(0b0111)
+=>
+(0xc8 + 0x07) & (0b1000)
+=>
+(0xcf) & (0b1000)
+=>
+0xc8
+
+
+size = 205, BYTES_PER_WORD = 8
+
+ALIGN(size, BYTES_PER_WORD)
+=>
+ALIGN(205, (size_t)8 - 1)
+=>
+__ALIGN_MASK(205, 7)
+(0xcd + 0x07) & ~(0b0111)
+=>
+(0xcd + 0x07) & (0b1000)
+=>
+(0xd4) & (0b1000)
+=>
+0xd0
+
