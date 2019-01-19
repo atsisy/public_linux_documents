@@ -1,0 +1,87 @@
+#+TITLE: kmem_cacheが使われているところのコードを読む
+
+* bvec_alloc関数
+** 動機
+   SLOBAがここでカーネルパニックを起こしたので。
+   bvec_allocで確保するオブジェクトのサイズを知りたい。
+** bvec_alloc関数
+   
+   bvl = kmem_cache_alloc(bvs->slab, __gfp_mask);
+
+   ここのbvsはなんだよ。
+   bvs->slabのslabがkmem_cache_createで初期化されるときのコードを見ればkmem_cache_allocで確保されるサイズがわかる。
+*** bvsなんだよ問題
+    bvsはbvec_alloc関数でbvec_slabsというグローバル変数から求めた値。ポインタ。
+
+    bvec_slabsの定義
+#+BEGIN_SRC c
+#define BV(x, n) { .nr_vecs = x, .name = "biovec-"#n }
+static struct biovec_slab bvec_slabs[BVEC_POOL_NR] __read_mostly = {
+	BV(1, 1), BV(4, 4), BV(16, 16), BV(64, 64), BV(128, 128), BV(BIO_MAX_PAGES, max),
+};
+#undef BV
+#+END_SRC
+    マクロBVはbiovec_slab構造体を初期化するためのものだが、スラブの初期化はしていない。
+    
+    ちなみに、bionic_slab構造体の定義はこんな感じ
+
+#+BEGIN_SRC c
+struct biovec_slab {
+	int nr_vecs;
+	char *name;
+	struct kmem_cache *slab;
+};
+#+END_SRC
+
+    例のマクロではメンバslabが初期化されないことがわかる。これは後で初期化するらしい。
+    つまり、その初期化部を見れば、kmem_cache_createの引数でサイズがわかるはず。
+*** bvec_slabsを初期化しているところ
+    bvec_slabsを初期化しているのは、biovec_init_slabsという関数。
+    ここで、biovec_slabs[n]->slabが初期化されている。そのコードがこれだ。
+
+#+BEGIN_SRC c
+static void __init biovec_init_slabs(void)
+{
+	int i;
+
+	for (i = 0; i < BVEC_POOL_NR; i++) {
+		int size;
+		struct biovec_slab *bvs = bvec_slabs + i;
+
+		if (bvs->nr_vecs <= BIO_INLINE_VECS) {
+			bvs->slab = NULL;
+			continue;
+		}
+
+		size = bvs->nr_vecs * sizeof(struct bio_vec);
+		bvs->slab = kmem_cache_create(bvs->name, size, 0,
+                                SLAB_HWCACHE_ALIGN|SLAB_PANIC, NULL);
+	}
+}
+#+END_SRC
+
+    ここで、kmem_cache_createが呼ばれているので、サイズがわかる。
+    サイズはbvs->nr_vecs * sizeof(struct bio_vec)で求められる。では、struct bio_vecのサイズを計算してみる。
+**** struct bio_vecのサイズ
+    構造体の定義はこのような具合。bvec.hに定義されている。
+
+#+BEGIN_SRC c
+struct bio_vec {
+	struct page	*bv_page;
+	unsigned int	bv_len;
+	unsigned int	bv_offset;
+};
+
+#+END_SRC
+    では、64bit環境で考えてみる。8 + (4 * 2)なので、16byteである。
+**** bvec_slabsの初期化で確保されるサイズ
+     struct bio_vecのサイズが16byteであることはわかった。なので、次は、kmem_cache_createのサイズを計算するために
+     使われているbvs->nr_vecsを考える。
+
+     bvec_slabsの初期化を見れば、その値がわかる。値の範囲は1 ~ BIO_MAX_PAGESの範囲で、
+     BIO_MAX_PAGESの定義（bio.h）を見れば、256かHPAGE_PMD_NRであることがわかる。今は、通常サイズのページを扱う
+     カーネルについて考えるので、値の範囲は1 ~ 256だとわかる。
+     
+     つまり、kmem_cache_createで渡されるサイズの範囲は
+
+     16 ~ 4096byteということになる。
